@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "AO3 Bookmark Notes Filter",
+  "version": "0.1.0",
+  "description": "在 AO3 作品的书签页一键切换为只显示带 note 的书签。",
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://archiveofourown.org/works/*/bookmarks*",
+        "https://archiveofourown.org/series/*/bookmarks*",
+        "https://archiveofourown.org/external_works/*/bookmarks*"
+      ],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

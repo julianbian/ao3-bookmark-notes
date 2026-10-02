@@ -1,0 +1,50 @@
+/* 筛选模式下隐藏原页面的计数、分页和书签条目（保留顶部的作品简介） */
+#main.ao3bn-active > h2.heading,
+#main.ao3bn-active > ol.pagination,
+#main.ao3bn-active > ol.bookmark > li.user {
+  display: none !important;
+}
+
+.ao3bn-panel {
+  display: none;
+}
+
+#main.ao3bn-active .ao3bn-panel {
+  display: block;
+}
+
+.ao3bn-toggle {
+  clear: both;
+  margin: 0.643em 0;
+  padding: 0;
+  list-style: none;
+  text-align: left;
+}
+
+.ao3bn-toggle li {
+  display: inline-block;
+  margin: 0 0.25em 0 0;
+}
+
+.ao3bn-toggle a,
+.ao3bn-toggle span {
+  display: inline-block;
+  padding: 0.25em 0.75em;
+  border: 1px solid #bbb;
+  border-radius: 0.25em;
+  cursor: pointer;
+}
+
+.ao3bn-toggle span.current {
+  background: #900;
+  border-color: #900;
+  color: #fff;
+}
+
+.ao3bn-message {
+  margin: 1em 0;
+}
+
+.ao3bn-message button {
+  margin-left: 0.5em;
+}
