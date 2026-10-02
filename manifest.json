@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "AO3 Bookmark Notes Filter",
-  "version": "0.1.0",
-  "description": "在 AO3 作品的书签页一键切换为只显示带 note 的书签。",
+  "name": "AO3 Bookmark Notes & Timeline",
+  "version": "0.2.0",
+  "description": "AO3 书签页只看附 note / 推荐的书签；导航栏加入订阅作者时间线。",
   "permissions": ["storage"],
   "content_scripts": [
     {
@@ -13,6 +13,11 @@
       ],
       "js": ["content.js"],
       "css": ["content.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://archiveofourown.org/*"],
+      "js": ["timeline.js"],
       "run_at": "document_idle"
     }
   ]
