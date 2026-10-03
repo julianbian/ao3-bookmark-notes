@@ -53,11 +53,13 @@ const AO3TL_BOOKMARKLET = true;
 
   // ---------- 抓取订阅列表 ----------
 
-  // AO3 页头的 "Hi, <username>!" 下拉链接正好是 /users/<username>，没有更多路径
+  // AO3 页头的 "Hi, <username>!" 下拉链接正好是 /users/<username>，没有更多路径。
+  // 未登录时 body 带 logged-out，而且页头有个 /users/login?return_to=... 的下拉链接，要排除掉
   function getCurrentUsername() {
-    for (const a of document.querySelectorAll('a.dropdown-toggle[href]')) {
-      const m = a.getAttribute('href').match(/^\/users\/([^/]+)$/);
-      if (m) return decodeURIComponent(m[1]);
+    if (document.body.classList.contains('logged-out')) return null;
+    for (const a of document.querySelectorAll('#header a.dropdown-toggle[href]')) {
+      const m = a.getAttribute('href').match(/^\/users\/([^/?#]+)$/);
+      if (m && m[1] !== 'login') return decodeURIComponent(m[1]);
     }
     return null;
   }
