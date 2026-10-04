@@ -48,12 +48,57 @@
   const PAGE_PARAM = 'bn_page';
   const STORAGE_KEY = 'ao3bnView';
 
-  const cache = new Map(); // `${view}:${page}` -> Promise<{ total, items, pagination }>
+  // 搜索结果缓存：30 分钟内直接用，不再请求 AO3；过期后重新请求，失败时退回旧缓存
+  const FRESH_MS = 30 * 60 * 1000;
+  const CACHE_PREFIX = 'ao3bn:page:';
+  const CACHE_INDEX_KEY = 'ao3bn:index'; // 缓存键 -> 抓取时间，用于淘汰最旧的
+  const RETRY_DELAYS_MS = [1500, 4000]; // 5xx / 网络错误时自动重试的间隔
+
+  const memory = new Map(); // 缓存键 -> Promise<data>，同一次页面里避免重复读存储
   const totals = {}; // view -> 总数
   let requestSeq = 0;
   let currentView = 'all';
 
-  // ---------- 搜索请求与解析 ----------
+  // ---------- 存储：插件里用 chrome.storage，bookmarklet 里用 AO3 域名下的 localStorage ----------
+
+  const hasExtensionStorage = typeof chrome !== 'undefined' && Boolean(chrome.storage && chrome.storage.local);
+  // localStorage 只有约 5MB 且和 AO3 自己共用，少存一些
+  const CACHE_MAX_ENTRIES = hasExtensionStorage ? 300 : 40;
+
+  async function storageGet(keys) {
+    try {
+      if (hasExtensionStorage) return await chrome.storage.local.get(keys);
+      const result = {};
+      for (const key of keys) {
+        const raw = localStorage.getItem(key);
+        if (raw !== null) result[key] = JSON.parse(raw);
+      }
+      return result;
+    } catch {
+      return {};
+    }
+  }
+
+  async function storageSet(items) {
+    try {
+      if (hasExtensionStorage) return await chrome.storage.local.set(items);
+      for (const [key, value] of Object.entries(items)) localStorage.setItem(key, JSON.stringify(value));
+    } catch {
+      /* 存不下就算了，下次重新请求 */
+    }
+  }
+
+  async function storageRemove(keys) {
+    if (!keys.length) return;
+    try {
+      if (hasExtensionStorage) return await chrome.storage.local.remove(keys);
+      for (const key of keys) localStorage.removeItem(key);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // ---------- 搜索请求、解析与缓存 ----------
 
   function searchUrl(view, page) {
     const params = new URLSearchParams({
@@ -73,20 +118,22 @@
     }
   }
 
-  function fetchPage(view, page) {
-    const key = `${view}:${page}`;
-    if (!cache.has(key)) {
-      const promise = fetch(searchUrl(view, page), { credentials: 'same-origin' })
-        .then((res) => {
-          if (!res.ok) throw new HttpError(res.status);
-          return res.text();
-        })
-        .then(parseSearchPage);
-      // 失败的请求不缓存，方便重试
-      promise.catch(() => cache.delete(key));
-      cache.set(key, promise);
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // 5xx（包括 Cloudflare 的 52x、530）和网络错误多半是 AO3 一时抽风，自动重试两次；429 不重试
+  async function fetchFromAO3(view, page, onRetry) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const res = await fetch(searchUrl(view, page), { credentials: 'same-origin' });
+        if (!res.ok) throw new HttpError(res.status);
+        return parseSearchPage(await res.text());
+      } catch (err) {
+        const retryable = err instanceof HttpError ? err.status >= 500 : err instanceof TypeError;
+        if (!retryable || attempt >= RETRY_DELAYS_MS.length) throw err;
+        onRetry?.(attempt + 1, err);
+        await sleep(RETRY_DELAYS_MS[attempt]);
+      }
     }
-    return cache.get(key);
   }
 
   // 确认搜索结果确实指向当前作品（防御性校验）
@@ -95,6 +142,7 @@
     return [...li.querySelectorAll('a[href]')].some((a) => ownPath.test(a.getAttribute('href')));
   }
 
+  // 解析成可存储的纯数据（HTML 字符串），渲染时再转回节点
   function parseSearchPage(html) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const docMain = doc.getElementById('main');
@@ -108,10 +156,11 @@
     const items = [...docMain.querySelectorAll('ol.bookmark > li.bookmark')]
       .filter(belongsHere)
       .map(toUserBlurb)
-      .filter(Boolean);
+      .filter(Boolean)
+      .map((li) => li.outerHTML);
 
-    const pagination = docMain.querySelector('ol.pagination');
-    return { total, items, pagination };
+    const pagination = docMain.querySelector('ol.pagination')?.outerHTML || null;
+    return { total, items, pagination, fetchedAt: Date.now() };
   }
 
   // 把搜索结果里的整条书签（含作品简介）转换成书签页那种只有书签人信息的条目
@@ -135,6 +184,49 @@
     // 剩下的就是书签 tags、notes 等
     li.append(...user.children);
     return li;
+  }
+
+  const cacheKey = (view, page) => `${CACHE_PREFIX}${kind}:${id}:${view}:${page}`;
+
+  async function readCached(key) {
+    const data = (await storageGet([key]))[key];
+    return data && Array.isArray(data.items) && typeof data.fetchedAt === 'number' ? data : null;
+  }
+
+  async function writeCached(key, data) {
+    const index = (await storageGet([CACHE_INDEX_KEY]))[CACHE_INDEX_KEY] || {};
+    index[key] = data.fetchedAt;
+    const oldest = Object.keys(index).sort((a, b) => index[a] - index[b]);
+    const evicted = oldest.slice(0, Math.max(0, oldest.length - CACHE_MAX_ENTRIES));
+    for (const k of evicted) delete index[k];
+    await storageRemove(evicted);
+    await storageSet({ [key]: data, [CACHE_INDEX_KEY]: index });
+  }
+
+  // 返回 { ...data, stale?, error? }：
+  //   缓存还新鲜 → 直接用；否则请求 AO3；请求失败但有旧缓存 → 用旧缓存并标记 stale
+  function getPage(view, page, { refresh = false, onRetry } = {}) {
+    const key = cacheKey(view, page);
+    if (!refresh && memory.has(key)) return memory.get(key);
+
+    const promise = (async () => {
+      const cached = await readCached(key);
+      if (!refresh && cached && Date.now() - cached.fetchedAt < FRESH_MS) return cached;
+      try {
+        const data = await fetchFromAO3(view, page, onRetry);
+        await writeCached(key, data);
+        return data;
+      } catch (error) {
+        if (cached) return { ...cached, stale: true, error };
+        throw error;
+      }
+    })();
+    memory.set(key, promise);
+    promise.then(
+      (data) => { if (data.stale) memory.delete(key); }, // 旧缓存只是应急，下次还要再试
+      () => memory.delete(key),
+    );
+    return promise;
   }
 
   // ---------- 界面 ----------
@@ -195,22 +287,28 @@
     renderToggle();
   }
 
-  function showMessage(text, retry) {
+  function showMessage(text, action) {
     message.replaceChildren(text);
-    if (retry) {
+    if (action) {
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.textContent = '重试';
-      btn.addEventListener('click', retry);
+      btn.textContent = action.label;
+      btn.addEventListener('click', action.run);
       message.append(btn);
     }
   }
 
-  function renderPagination(source, view) {
+  function htmlToElement(html) {
+    const template = document.createElement('template');
+    template.innerHTML = html;
+    return template.content.firstElementChild;
+  }
+
+  function renderPagination(sourceHtml, view) {
     for (const slot of pagerSlots) {
       slot.replaceChildren();
-      if (!source) continue;
-      const pager = source.cloneNode(true);
+      if (!sourceHtml) continue;
+      const pager = htmlToElement(sourceHtml);
       for (const a of pager.querySelectorAll('a[href]')) {
         const page = Number(new URL(a.getAttribute('href'), location.origin).searchParams.get('page')) || 1;
         a.href = urlFor({ view, page });
@@ -229,7 +327,22 @@
     toggle.scrollIntoView({ block: 'start' });
   });
 
-  async function showFilteredPage(view, page) {
+  function describeError(err) {
+    if (err.status === 429) return 'AO3 暂时限制了请求频率（429），请稍等一会儿再试。';
+    if (err.status >= 500) return `AO3 暂时无法访问（HTTP ${err.status}），可能在维护或负载过高。`;
+    if (err instanceof TypeError) return '网络连接失败，请检查网络后再试。';
+    return `加载失败：${err.message}`;
+  }
+
+  function describeAge(fetchedAt) {
+    const minutes = Math.round((Date.now() - fetchedAt) / 60000);
+    if (minutes < 1) return '刚刚';
+    if (minutes < 60) return `${minutes} 分钟前`;
+    const hours = Math.round(minutes / 60);
+    return hours < 24 ? `${hours} 小时前` : `${Math.round(hours / 24)} 天前`;
+  }
+
+  async function showFilteredPage(view, page, refresh = false) {
     const seq = ++requestSeq;
     const config = VIEWS[view];
     heading.textContent = config.heading;
@@ -237,22 +350,33 @@
     renderPagination(null);
     showMessage('加载中…');
 
+    const reload = { label: '重新加载', run: () => showFilteredPage(view, page, true) };
     let data;
     try {
-      data = await fetchPage(view, page);
+      data = await getPage(view, page, {
+        refresh,
+        onRetry: (n, err) => {
+          if (seq === requestSeq) showMessage(`${describeError(err)} 正在自动重试（第 ${n} 次）…`);
+        },
+      });
     } catch (err) {
       if (seq !== requestSeq) return;
-      const text = err.status === 429
-        ? 'AO3 暂时限制了请求频率（429），请稍等一会儿再试。'
-        : `加载失败：${err.message}`;
-      showMessage(text, () => showFilteredPage(view, page));
+      showMessage(describeError(err), reload);
       return;
     }
     if (seq !== requestSeq) return;
 
     setTotal(view, data.total);
+    if (data.stale) {
+      showMessage(`${describeError(data.error)} 下面显示的是 ${describeAge(data.fetchedAt)}缓存的内容。`, reload);
+    } else if (Date.now() - data.fetchedAt > 60 * 1000) {
+      showMessage(`${describeAge(data.fetchedAt)}加载的内容。`, reload);
+    } else {
+      showMessage('');
+    }
+
     if (data.total === 0) {
-      showMessage(config.empty);
+      if (!data.stale) showMessage(config.empty);
       return;
     }
 
@@ -262,9 +386,8 @@
     heading.textContent = data.items.length
       ? `${config.heading}：第 ${from} - ${to} 条，共 ${data.total.toLocaleString()} 条`
       : `${config.heading}：共 ${data.total.toLocaleString()} 条`;
-    showMessage(data.items.length ? '' : '这一页没有结果。');
-    // 节点只能挂在一处，从缓存再次渲染时用克隆
-    resultList.replaceChildren(...data.items.map((li) => li.cloneNode(true)));
+    if (!data.items.length && !data.stale) showMessage('这一页没有结果。');
+    resultList.replaceChildren(...data.items.map(htmlToElement));
     renderPagination(data.pagination, view);
   }
 
@@ -307,28 +430,14 @@
     render(state);
   });
 
-  // 记住上次选择的视图：插件里用 chrome.storage，bookmarklet 里用 AO3 域名下的 localStorage
-  const hasExtensionStorage = typeof chrome !== 'undefined' && Boolean(chrome.storage && chrome.storage.local);
-
-  function loadPreference() {
-    return new Promise((resolve) => {
-      const done = (view) => resolve(view in VIEWS ? view : 'all');
-      try {
-        if (hasExtensionStorage) chrome.storage.local.get(STORAGE_KEY, (r) => done(r && r[STORAGE_KEY]));
-        else done(localStorage.getItem(STORAGE_KEY));
-      } catch {
-        done('all');
-      }
-    });
+  // 记住上次选择的视图
+  async function loadPreference() {
+    const view = (await storageGet([STORAGE_KEY]))[STORAGE_KEY];
+    return view in VIEWS ? view : 'all';
   }
 
   function savePreference(view) {
-    try {
-      if (hasExtensionStorage) chrome.storage.local.set({ [STORAGE_KEY]: view });
-      else localStorage.setItem(STORAGE_KEY, view);
-    } catch {
-      /* ignore */
-    }
+    storageSet({ [STORAGE_KEY]: view });
   }
 
   (async () => {
@@ -339,11 +448,11 @@
     history.replaceState({ ...history.state, ao3bn: state }, '');
     render(state);
 
-    // 依次预取其他筛选视图的第一页，用于在按钮上显示数量
+    // 依次取其他筛选视图的第一页（有缓存就不请求），用于在按钮上显示数量
     for (const view of FILTER_VIEWS) {
       if (view === state.view) continue;
       try {
-        setTotal(view, (await fetchPage(view, 1)).total);
+        setTotal(view, (await getPage(view, 1)).total);
       } catch {
         /* 数量拿不到就不显示 */
       }
